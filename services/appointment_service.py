@@ -372,7 +372,9 @@ def get_available_slots(date: str, service_type: str = "haircut") -> List[str]:
                     hour=hour, 
                     minute=minute
                 )
-                if slot_time > get_current_datetime() + timedelta(hours=1):
+                # Add all future slots (more than 1 hour away)
+                # For dates beyond today, include all slots
+                if target_date.date() > get_current_datetime().date() or slot_time > get_current_datetime() + timedelta(hours=1):
                     all_slots.append(slot_time)
         
         logger.info(f"Generated {len(all_slots)} possible slots for {target_date}")
@@ -381,9 +383,9 @@ def get_available_slots(date: str, service_type: str = "haircut") -> List[str]:
         existing_appointments = get_appointments_for_date(target_date)
         logger.info(f"Found {len(existing_appointments)} existing appointments for {target_date}")
         
-        # Use mock data if the sheet is empty but we're using FORCE_MOCK_DB
-        if not existing_appointments and not FORCE_MOCK_DB:
-            # Since the sheet appears empty, just return all slots as available
+        # If no appointments found in the future, just return all slots
+        # Added extra check for future dates
+        if not existing_appointments:
             logger.info(f"No existing appointments found, all slots are available")
             return [slot.strftime("%I:%M %p") for slot in all_slots]
         
@@ -1258,128 +1260,6 @@ def reschedule_appointment(phone: str, entities: Dict[str, Any]) -> Dict[str, An
             'message': "There was an unexpected error rescheduling your appointment. Please try again."
         }
 
-def check_availability(date_str: str = None) -> str:
-    """
-    Check appointment availability for a given date or day.
-    If no date is provided, check for today.
-    Returns a formatted string with available slots.
-    """
-    try:
-        # Handle both string and dictionary inputs (for backward compatibility)
-        if isinstance(date_str, dict):
-            logger.info(f"Received dictionary input: {date_str}")
-            if 'date' in date_str:
-                date_str = date_str['date']
-                logger.info(f"Extracted date string: {date_str}")
-            else:
-                logger.warning("Received dictionary input with no 'date' key")
-                date_str = None
-                
-        # Get the current date
-        current_date = datetime.now().date()
-        current_date_str = current_date.strftime("%Y-%m-%d")
-        logger.info(f"Current date: {current_date_str}")
-        
-        # Parse the requested date
-        if not date_str:
-            # If no date provided, use today
-            requested_date_str = current_date_str
-            logger.info(f"No date provided, using today: {requested_date_str}")
-        else:
-            # Handle relative date terms
-            if date_str.lower() == "today":
-                requested_date_str = current_date_str
-                logger.info(f"Requested 'today', using: {requested_date_str}")
-            elif date_str.lower() == "tomorrow":
-                requested_date_str = (current_date + timedelta(days=1)).strftime("%Y-%m-%d")
-                logger.info(f"Requested 'tomorrow', using: {requested_date_str}")
-            else:
-                # Try to parse the provided date
-                parsed_date = parse_datetime(date_str)
-                if not parsed_date:
-                    logger.warning(f"Could not parse date: {date_str}")
-                    return "I couldn't understand that date. Please provide a date like 'Monday' or 'October 7'."
-                requested_date_str = parsed_date.strftime("%Y-%m-%d")
-                logger.info(f"Parsed requested date: {requested_date_str}")
-        
-        # Check if the requested date is in the past
-        requested_date = datetime.strptime(requested_date_str, "%Y-%m-%d").date()
-        if requested_date < current_date:
-            logger.info(f"Requested date {requested_date_str} is in the past")
-            # Find the next available date (today or the next working day)
-            next_date = current_date
-            while not is_working_day(next_date.strftime("%Y-%m-%d")):
-                next_date += timedelta(days=1)
-            next_date_str = next_date.strftime("%Y-%m-%d")
-            logger.info(f"Suggesting next available date: {next_date_str}")
-            formatted_date = format_date_for_display(next_date_str)
-            return f"The date you requested has already passed. The next available date is {formatted_date}. Would you like to check availability for that date?"
-        
-        # Check if the requested date is a working day
-        if not is_working_day(requested_date_str):
-            logger.info(f"Requested date {requested_date_str} is not a working day")
-            # Find the next working day
-            next_date = requested_date + timedelta(days=1)
-            while not is_working_day(next_date.strftime("%Y-%m-%d")):
-                next_date += timedelta(days=1)
-            next_date_str = next_date.strftime("%Y-%m-%d")
-            logger.info(f"Suggesting next working day: {next_date_str}")
-            formatted_date = format_date_for_display(next_date_str)
-            return f"We're closed on the requested date. The next available date is {formatted_date}. Would you like to check availability for that date?"
-        
-        # Get available slots for the requested date
-        # Use the real database data instead of mock slots
-        available_slots = get_available_slots(requested_date_str, service_type="haircut")
-        
-        if not available_slots:
-            # No slots available on this date
-            logger.info(f"No available slots for {requested_date_str}")
-            # Try to find the next date with availability
-            next_date = requested_date + timedelta(days=1)
-            max_tries = 7  # Look ahead up to a week
-            tries = 0
-            next_date_with_slots = None
-            
-            while tries < max_tries:
-                next_date_str = next_date.strftime("%Y-%m-%d")
-                if is_working_day(next_date_str):
-                    next_slots = get_available_slots(next_date_str)
-                    if next_slots:
-                        next_date_with_slots = next_date
-                        break
-                next_date += timedelta(days=1)
-                tries += 1
-            
-            if next_date_with_slots:
-                next_date_formatted = format_date_for_display(next_date_with_slots.strftime("%Y-%m-%d"))
-                return f"I'm sorry, but there are no available slots on {formatted_date}. The next date with availability is {next_date_formatted}. Would you like to check the available times for that date?"
-            else:
-                return f"I'm sorry, but there are no available slots on {formatted_date} or in the next week. Would you like to check availability for a later date?"
-        
-        # Format the response
-        formatted_date = format_date_for_display(requested_date_str)
-        
-        # Group slots by time of day
-        morning_slots = [slot for slot in available_slots if "AM" in slot]
-        afternoon_slots = [slot for slot in available_slots if "PM" in slot and int(slot.split(":")[0]) < 5]
-        evening_slots = [slot for slot in available_slots if "PM" in slot and int(slot.split(":")[0]) >= 5]
-        
-        response = f"Available slots for {formatted_date}:\n"
-        
-        if morning_slots:
-            response += "Morning: " + ", ".join(morning_slots) + "\n"
-        if afternoon_slots:
-            response += "Afternoon: " + ", ".join(afternoon_slots) + "\n"
-        if evening_slots:
-            response += "Evening: " + ", ".join(evening_slots)
-        
-        logger.info(f"Returning availability for {requested_date_str} with {len(available_slots)} slots")
-        return response
-        
-    except Exception as e:
-        logger.error(f"Error checking availability: {e}")
-        return "I'm having trouble checking appointment availability right now. Please try again later or contact us directly."
-
 def get_upcoming_appointments(phone: str) -> str:
     """Get a list of upcoming appointments for a customer."""
     try:
@@ -1391,13 +1271,147 @@ def get_upcoming_appointments(phone: str) -> str:
         result = "Your upcoming appointments:\n"
         for idx, appt in enumerate(appointments[:5], 1):  # Show up to 5 upcoming appointments
             dt = dateutil_parse(appt['datetime'])
-            result += f"{idx}. {dt.strftime('%A, %B %d at %I:%M %p')} - {appt['service_type']}\n"
+            recipient_info = ""
+            if 'recipient' in appt and appt['recipient'] and appt['recipient'].lower() != 'self':
+                recipient_info = f" for {appt['recipient']}"
+            result += f"{idx}. {dt.strftime('%A, %B %d at %I:%M %p')}{recipient_info} - {appt['service_type']}\n"
         
         return result
     
     except Exception as e:
         logger.error(f"Error getting upcoming appointments: {e}")
         return "There was an error retrieving your appointments. Please try again."
+
+def get_upcoming_appointments_raw(phone: str) -> List[Dict[str, Any]]:
+    """Get raw data for upcoming appointments for a customer.
+    
+    Used by agent to count and enforce appointment limits.
+    
+    Args:
+        phone: The customer's phone number
+        
+    Returns:
+        List of appointment dictionaries
+    """
+    try:
+        appointments = get_appointments_for_phone(phone)
+        if not appointments:
+            return []
+        
+        # Return raw appointment data for processing
+        return appointments
+    
+    except Exception as e:
+        logger.error(f"Error getting raw upcoming appointments: {e}")
+        return []
+
+def check_availability(date_str: str = None) -> str:
+    """Check availability for a given date and return available time slots."""
+    try:
+        now = get_current_datetime()
+        
+        # If no date specified, use tomorrow
+        if not date_str:
+            target_date = now.date() + timedelta(days=1)
+            requested_date_str = target_date.strftime("%Y-%m-%d")
+            logger.info(f"No date specified, defaulting to tomorrow: {requested_date_str}")
+        else:
+            # Try to parse the date
+            logger.info(f"Checking availability for requested date: {date_str}")
+            requested_date_str = date_str.strip()
+            
+            # If date is in ISO format (YYYY-MM-DD)
+            if re.match(r'^\d{4}-\d{2}-\d{2}$', requested_date_str):
+                target_date = datetime.strptime(requested_date_str, "%Y-%m-%d").date()
+                logger.info(f"Parsed as ISO format date: {target_date}")
+            else:
+                # Try to interpret as a date string
+                try:
+                    parsed_date = dateutil_parse(requested_date_str, fuzzy=True)
+                    target_date = parsed_date.date()
+                    requested_date_str = target_date.strftime("%Y-%m-%d")
+                    logger.info(f"Parsed date using dateutil: {target_date}")
+                except:
+                    # Default to tomorrow if parsing fails
+                    target_date = now.date() + timedelta(days=1)
+                    requested_date_str = target_date.strftime("%Y-%m-%d")
+                    logger.warning(f"Could not parse date '{date_str}', using tomorrow: {requested_date_str}")
+        
+        # Ensure we're working with datetime objects for comparison
+        current_date = now.date()
+        logger.info(f"Current date: {current_date}")
+        logger.info(f"Parsed requested date: {target_date}")
+        
+        # Check if the date is in the past
+        if target_date < current_date:
+            logger.warning(f"Requested date {target_date} is in the past")
+            # Use tomorrow's date instead
+            target_date = current_date + timedelta(days=1)
+            requested_date_str = target_date.strftime("%Y-%m-%d")
+            logger.info(f"Using tomorrow's date instead: {requested_date_str}")
+
+        # Get available slots for the date
+        target_date_full = datetime.combine(target_date, time(0, 0, 0))
+        logger.info(f"Using target date: {target_date_full}")
+        
+        # Get available slots for the date
+        available_slots = get_available_slots(requested_date_str)
+        
+        # Format the response
+        formatted_date = format_date_for_display(requested_date_str)
+        
+        if not available_slots:
+            nearby_dates = []
+            # Check next 3 business days for availability
+            for i in range(1, 4):
+                check_date = target_date + timedelta(days=i)
+                check_date_str = check_date.strftime("%Y-%m-%d")
+                
+                # Skip Sundays
+                if check_date.weekday() == 6:  # Sunday
+                    continue
+                    
+                nearby_slots = get_available_slots(check_date_str)
+                if nearby_slots:
+                    nearby_dates.append(check_date_str)
+            
+            if nearby_dates:
+                alt_dates = ", ".join([format_date_for_display(d) for d in nearby_dates])
+                return f"I'm sorry, but there are no available slots for {formatted_date}. However, I found availability on: {alt_dates}. Would you like to see the available times for any of these dates?"
+            else:
+                return f"I'm sorry, but there are no available slots for {formatted_date} or the next few business days. Would you like to check a different date?"
+        
+        # Format slots into morning, afternoon, evening categories
+        morning_slots = []
+        afternoon_slots = []
+        evening_slots = []
+        
+        for slot in available_slots:
+            slot_time = dateutil_parse(slot).time()
+            formatted_time = datetime.strptime(f"{slot_time.hour}:{slot_time.minute}", "%H:%M").strftime("%I:%M %p")
+            
+            if slot_time.hour < 12:
+                morning_slots.append(formatted_time)
+            elif slot_time.hour < 17:
+                afternoon_slots.append(formatted_time)
+            else:
+                evening_slots.append(formatted_time)
+        
+        response = f"Available slots for {formatted_date}:"
+        
+        if morning_slots:
+            response += f"\nMorning: {', '.join(morning_slots)}"
+        if afternoon_slots:
+            response += f"\nAfternoon: {', '.join(afternoon_slots)}"
+        if evening_slots:
+            response += f"\nEvening: {', '.join(evening_slots)}"
+        
+        logger.info(f"Returning availability for {requested_date_str} with {len(available_slots)} slots")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error checking availability: {e}")
+        return "I'm having trouble checking appointment availability right now. Please try again later or contact us directly."
 
 def is_working_day(date_str: str) -> bool:
     """Check if a date is a working day."""
