@@ -26,6 +26,7 @@ TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
 # Telegram configuration
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 BARBER_TELEGRAM_ID = os.environ.get('BARBER_TELEGRAM_ID', '')  # Telegram ID of the barber
+BARBER_BOT_TOKEN = os.environ.get('BARBER_BOT_TOKEN', '')  # Separate bot token for barber notifications
 
 # Track reminders and notifications
 scheduled_reminders = {}
@@ -47,10 +48,13 @@ def get_twilio_client():
     """Get Twilio client or None if credentials not available."""
     return twilio_client
 
-def send_telegram_message(chat_id: str, message: str) -> bool:
+def send_telegram_message(chat_id: str, message: str, use_barber_bot: bool = False) -> bool:
     """Send a message via Telegram API"""
-    if not TELEGRAM_TOKEN:
-        logger.warning("Telegram token not found, can't send Telegram messages")
+    # Determine which token to use
+    bot_token = BARBER_BOT_TOKEN if use_barber_bot and BARBER_BOT_TOKEN else TELEGRAM_TOKEN
+    
+    if not bot_token:
+        logger.warning(f"Telegram token not found for {'barber bot' if use_barber_bot else 'customer bot'}, can't send Telegram messages")
         return False
     
     # Remove the +tg prefix if present
@@ -58,7 +62,7 @@ def send_telegram_message(chat_id: str, message: str) -> bool:
         chat_id = chat_id[3:]
     
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         data = {
             "chat_id": chat_id,
             "text": message,
@@ -67,7 +71,7 @@ def send_telegram_message(chat_id: str, message: str) -> bool:
         response = requests.post(url, data=data, timeout=10)
         
         if response.status_code == 200:
-            logger.info(f"Telegram message sent to {chat_id}: {message}")
+            logger.info(f"Telegram message sent to {chat_id} using {'barber bot' if use_barber_bot else 'customer bot'}: {message}")
             return True
         else:
             logger.error(f"Failed to send Telegram message: {response.text}")
@@ -236,65 +240,108 @@ def notify_barber_of_booking(barber_phone: str, customer_phone: str, appointment
     # Create the notification message
     message = f"📅 *New Appointment*\nTime: {formatted_time}\nCustomer: {customer_info}{recipient_info}"
     
-    # Send to barber's phone
-    sms_sent = send_sms(barber_phone, message)
+    # Send via different notification channels
+    notification_sent = False
     
-    # Also send to barber's Telegram if configured
-    telegram_sent = False
+    # Try SMS if Twilio is configured
+    if twilio_client and TWILIO_PHONE_NUMBER:
+        sms_sent = send_sms(barber_phone, message)
+        notification_sent = notification_sent or sms_sent
+    
+    # Try Telegram with regular customer bot if barber's ID is configured
     if BARBER_TELEGRAM_ID:
         telegram_sent = send_telegram_message(BARBER_TELEGRAM_ID, message)
+        notification_sent = notification_sent or telegram_sent
     
-    # Return True if at least one message was sent
-    return sms_sent or telegram_sent
+    # Try dedicated barber bot if configured
+    if BARBER_BOT_TOKEN and BARBER_TELEGRAM_ID:
+        barber_bot_sent = send_telegram_message(BARBER_TELEGRAM_ID, message, use_barber_bot=True)
+        notification_sent = notification_sent or barber_bot_sent
+    
+    # Log outcome
+    if notification_sent:
+        logger.info(f"Successfully sent booking notification to barber for appointment at {formatted_time}")
+    else:
+        logger.warning(f"Failed to send any booking notifications to barber for appointment at {formatted_time}")
+    
+    return notification_sent
 
 def notify_barber_of_cancellation(barber_phone: str, customer_phone: str, appointment_time: datetime) -> bool:
-    """Notify the barber about a cancellation."""
+    """Notify the barber about a cancelled appointment.
+    
+    Args:
+        barber_phone: The barber's phone number
+        customer_phone: The customer's phone number
+        appointment_time: The scheduled appointment time
+        
+    Returns:
+        True if the notification was sent successfully, False otherwise
+    """
     formatted_time = appointment_time.strftime("%A, %B %d at %I:%M %p")
     
-    # Get customer info
-    if customer_phone.startswith('+tg'):
-        customer_info = f"Telegram user {customer_phone.replace('+tg', '')}"
-    else:
-        customer_info = customer_phone
-    
     # Create the notification message
-    message = f"❌ *Appointment Cancelled*\nTime: {formatted_time}\nCustomer: {customer_info}"
+    message = f"❌ *Cancelled Appointment*\nTime: {formatted_time}\nCustomer: {customer_phone}"
     
-    # Send to barber's phone
-    sms_sent = send_sms(barber_phone, message)
+    # Send via different notification channels
+    notification_sent = False
     
-    # Also send to barber's Telegram if configured
-    telegram_sent = False
+    # Try SMS if Twilio is configured
+    if twilio_client and TWILIO_PHONE_NUMBER:
+        sms_sent = send_sms(barber_phone, message)
+        notification_sent = notification_sent or sms_sent
+    
+    # Try Telegram with regular customer bot if barber's ID is configured
     if BARBER_TELEGRAM_ID:
         telegram_sent = send_telegram_message(BARBER_TELEGRAM_ID, message)
+        notification_sent = notification_sent or telegram_sent
     
-    # Return True if at least one message was sent
-    return sms_sent or telegram_sent
+    # Try dedicated barber bot if configured
+    if BARBER_BOT_TOKEN and BARBER_TELEGRAM_ID:
+        barber_bot_sent = send_telegram_message(BARBER_TELEGRAM_ID, message, use_barber_bot=True)
+        notification_sent = notification_sent or barber_bot_sent
+    
+    return notification_sent
 
 def notify_barber_of_reschedule(barber_phone: str, customer_phone: str, old_time: datetime, new_time: datetime) -> bool:
-    """Notify the barber about a rescheduled appointment."""
-    old_formatted_time = old_time.strftime("%A, %B %d at %I:%M %p")
-    new_formatted_time = new_time.strftime("%A, %B %d at %I:%M %p")
+    """Notify the barber about a rescheduled appointment.
     
-    # Get customer info
-    if customer_phone.startswith('+tg'):
-        customer_info = f"Telegram user {customer_phone.replace('+tg', '')}"
-    else:
-        customer_info = customer_phone
+    Args:
+        barber_phone: The barber's phone number
+        customer_phone: The customer's phone number
+        old_time: The original appointment time
+        new_time: The new appointment time
+        
+    Returns:
+        True if the notification was sent successfully, False otherwise
+    """
+    old_formatted = old_time.strftime("%A, %B %d at %I:%M %p")
+    new_formatted = new_time.strftime("%A, %B %d at %I:%M %p")
     
     # Create the notification message
-    message = f"🔄 *Appointment Rescheduled*\nCustomer: {customer_info}\nOld time: {old_formatted_time}\nNew time: {new_formatted_time}"
+    message = f"🔄 *Rescheduled Appointment*\n"
+    message += f"Customer: {customer_phone}\n"
+    message += f"From: {old_formatted}\n"
+    message += f"To: {new_formatted}"
     
-    # Send to barber's phone
-    sms_sent = send_sms(barber_phone, message)
+    # Send via different notification channels
+    notification_sent = False
     
-    # Also send to barber's Telegram if configured
-    telegram_sent = False
+    # Try SMS if Twilio is configured
+    if twilio_client and TWILIO_PHONE_NUMBER:
+        sms_sent = send_sms(barber_phone, message)
+        notification_sent = notification_sent or sms_sent
+    
+    # Try Telegram with regular customer bot if barber's ID is configured
     if BARBER_TELEGRAM_ID:
         telegram_sent = send_telegram_message(BARBER_TELEGRAM_ID, message)
+        notification_sent = notification_sent or telegram_sent
     
-    # Return True if at least one message was sent
-    return sms_sent or telegram_sent
+    # Try dedicated barber bot if configured
+    if BARBER_BOT_TOKEN and BARBER_TELEGRAM_ID:
+        barber_bot_sent = send_telegram_message(BARBER_TELEGRAM_ID, message, use_barber_bot=True)
+        notification_sent = notification_sent or barber_bot_sent
+    
+    return notification_sent
 
 def send_booking_confirmation(phone_number: str, appointment_time: datetime, service_type: str, appointment_id: str) -> bool:
     """Send a booking confirmation to the customer.

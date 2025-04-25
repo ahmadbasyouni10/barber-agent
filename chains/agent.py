@@ -6,9 +6,14 @@ from langchain.schema import SystemMessage
 from langchain.memory import ConversationBufferMemory
 from langchain.tools import tool
 import os
-import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 import logging
+import secrets
+from twilio.twiml.messaging_response import MessagingResponse
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
+from flask import render_template_string
 
 # Dictionary to store agent memory by phone number
 CONVERSATION_MEMORY_CACHE = {}
@@ -38,7 +43,12 @@ def book_appointment(
     
     Args:
         phone_number: The customer's phone number.
-        date: The date for the appointment (e.g. '2023-10-15', 'tomorrow', 'next friday').
+        date: The date for the appointment. Can be:
+            - An absolute date like '2025-04-26'
+            - A relative date like 'tomorrow', 'next friday', 'in 3 days'
+            - A day of week with context like 'thursday in 6 days'
+            IMPORTANT: Always calculate the actual future date based on current date,
+            never use hardcoded past dates.
         time: The time for the appointment (e.g. '3:00 PM', '15:00').
         service_type: Type of service requested (default: haircut).
         recipient: Who the appointment is for (default: 'self', can be 'brother', 'friend', etc.)
@@ -55,12 +65,12 @@ def book_appointment(
         phone_number = "1234567890"  # Default for web testing
     
     # Handle date manually instead of relying on parser
-    now = datetime.datetime.now()
+    now = datetime.now()
     appointment_date = None
     
     # Direct handling of special date formats
     if date.lower() == "tomorrow":
-        appointment_date = now + datetime.timedelta(days=1)
+        appointment_date = now + timedelta(days=1)
     elif date.lower() == "today":
         appointment_date = now
     elif date.lower().startswith("next "):
@@ -71,7 +81,7 @@ def book_appointment(
                 days_until = (i - now.weekday()) % 7
                 if days_until == 0:  # If it's the same day of week, go to next week
                     days_until = 7
-                appointment_date = now + datetime.timedelta(days=days_until)
+                appointment_date = now + timedelta(days=days_until)
                 break
     else:
         # Try to parse as ISO format
@@ -80,13 +90,13 @@ def book_appointment(
                 parts = date.split("-")
                 if len(parts) == 3:
                     year, month, day = map(int, parts)
-                    appointment_date = datetime.datetime(year, month, day)
+                    appointment_date = datetime(year, month, day)
         except:
             pass
     
     # If we couldn't parse the date, use tomorrow as a fallback
     if not appointment_date:
-        appointment_date = now + datetime.timedelta(days=1)
+        appointment_date = now + timedelta(days=1)
         logger.warning(f"Could not parse date '{date}', using tomorrow instead")
     
     # Handle time manually
@@ -219,7 +229,62 @@ def check_availability(date: str, service_type: Optional[str] = "haircut") -> st
     Returns:
         A string listing the available time slots.
     """
-    return check_avail_service(date)
+    # Handle date manually instead of relying on parser
+    now = datetime.now()
+    appointment_date = None
+    
+    # Direct handling of special date formats
+    if date.lower() == "tomorrow":
+        appointment_date = now + timedelta(days=1)
+    elif date.lower() == "today":
+        appointment_date = now
+    elif date.lower().startswith("next "):
+        # Handle "next monday", "next tuesday", etc.
+        day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        for i, day_name in enumerate(day_names):
+            if day_name in date.lower():
+                days_until = (i - now.weekday()) % 7
+                if days_until == 0:  # If it's the same day of week, go to next week
+                    days_until = 7
+                appointment_date = now + timedelta(days=days_until)
+                break
+    else:
+        # Try to parse as ISO format or month/day format
+        try:
+            if "-" in date:
+                parts = date.split("-")
+                if len(parts) == 3:
+                    year, month, day = map(int, parts)
+                    appointment_date = datetime(year, month, day)
+            # Handle formats like "april 26"
+            elif " " in date:
+                # Current year should be used when only month and day are provided
+                month_names = ["january", "february", "march", "april", "may", "june", "july", 
+                              "august", "september", "october", "november", "december"]
+                month_name_part = date.split(" ")[0].lower()
+                day_part = ''.join(c for c in date.split(" ")[1] if c.isdigit())
+                
+                for i, month_name in enumerate(month_names):
+                    if month_name.startswith(month_name_part):
+                        month_num = i + 1
+                        day_num = int(day_part)
+                        # Use current year
+                        year = now.year
+                        appointment_date = datetime(year, month_num, day_num)
+                        break
+        except:
+            pass
+    
+    # If we couldn't parse the date, use tomorrow as a fallback
+    if not appointment_date:
+        appointment_date = now + timedelta(days=1)
+        logger.warning(f"Could not parse date '{date}', using tomorrow instead")
+    
+    # Format as string for the API
+    formatted_date = appointment_date.strftime("%Y-%m-%d")
+    logger.info(f"Formatted availability check date: {formatted_date}")
+    
+    return check_avail_service(formatted_date)
 
 @tool
 def get_upcoming_appointments(phone_number: str) -> str:
@@ -233,6 +298,84 @@ def get_upcoming_appointments(phone_number: str) -> str:
     """
     return get_upcoming_service(phone_number)
 
+@tool
+def calculate_date(date_expression: str) -> str:
+    """Calculate a specific calendar date from a natural language date expression.
+    
+    Args:
+        date_expression: A natural language date expression like 'tomorrow', 
+                         'next friday', 'in 3 days', 'thursday in 6 days', etc.
+    
+    Returns:
+        The calculated date in YYYY-MM-DD format.
+    """
+    logger.info(f"Calculating date from expression: {date_expression}")
+    
+    # Handle date manually
+    now = datetime.now()
+    calculated_date = None
+    
+    # Direct handling of special date formats
+    if date_expression.lower() == "tomorrow":
+        calculated_date = now + timedelta(days=1)
+    elif date_expression.lower() == "today":
+        calculated_date = now
+    elif "in" in date_expression.lower() and "days" in date_expression.lower():
+        # Handle "in X days"
+        try:
+            # Extract the number from expressions like "in 3 days", "in 6 days"
+            words = date_expression.lower().split()
+            for i, word in enumerate(words):
+                if word == "in" and i < len(words) - 1 and words[i+1].isdigit():
+                    days = int(words[i+1])
+                    calculated_date = now + timedelta(days=days)
+                    break
+        except:
+            logger.warning(f"Failed to parse 'in X days' from: {date_expression}")
+    elif date_expression.lower().startswith("next "):
+        # Handle "next monday", "next tuesday", etc.
+        day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        for i, day_name in enumerate(day_names):
+            if day_name in date_expression.lower():
+                days_until = (i - now.weekday()) % 7
+                if days_until == 0:  # If it's the same day of week, go to next week
+                    days_until = 7
+                calculated_date = now + timedelta(days=days_until)
+                break
+    else:
+        # Try to extract day name and "in X days" together
+        # e.g., "thursday in 6 days"
+        day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        for day_name in day_names:
+            if day_name in date_expression.lower() and "in" in date_expression.lower() and "days" in date_expression.lower():
+                try:
+                    # Extract the number of days
+                    words = date_expression.lower().split()
+                    for i, word in enumerate(words):
+                        if word == "in" and i < len(words) - 1 and words[i+1].isdigit():
+                            days = int(words[i+1])
+                            target_date = now + timedelta(days=days)
+                            logger.info(f"Calculated base date {days} days from now: {target_date}")
+                            
+                            # Now make sure it's the right day of the week
+                            day_index = day_names.index(day_name)
+                            days_to_adjust = (day_index - target_date.weekday()) % 7
+                            calculated_date = target_date + timedelta(days=days_to_adjust)
+                            logger.info(f"Adjusted to {day_name}: {calculated_date}")
+                            break
+                except Exception as e:
+                    logger.warning(f"Failed to parse complex date expression: {date_expression}. Error: {e}")
+    
+    # If we couldn't parse the date, use tomorrow as a fallback
+    if not calculated_date:
+        logger.warning(f"Could not parse date '{date_expression}', using tomorrow instead")
+        calculated_date = now + timedelta(days=1)
+    
+    # Format the date as YYYY-MM-DD
+    formatted_date = calculated_date.strftime("%Y-%m-%d")
+    logger.info(f"Calculated date '{date_expression}' to: {formatted_date}")
+    return formatted_date
+
 def create_barber_agent(memory=None, phone_number=None):
     """Create a LangChain agent for the barber scheduling system."""
     # Define the tools the agent can use
@@ -241,7 +384,8 @@ def create_barber_agent(memory=None, phone_number=None):
         cancel_appointment,
         reschedule_appointment,
         check_availability,
-        get_upcoming_appointments
+        get_upcoming_appointments,
+        calculate_date
     ]
     
     # Create a chat model - use OpenAI by default since Ollama doesn't fully support functions
@@ -279,14 +423,21 @@ IMPORTANT GUIDELINES:
    and wait for their confirmation before proceeding.
 3. If the requested time is unavailable, offer specific alternatives.
 4. Provide complete information in your responses.
-5. Handle date expressions like "tomorrow", "next Friday", "in 2 days", etc.
+5. PROPERLY HANDLE DATE REFERENCES:
+   - For "tomorrow" use tomorrow's actual date
+   - For "in X days" add X days to the current date
+   - For "next [weekday]" find the next occurrence of that day
+   - For "Thursday in 6 days" or similar, calculate the actual date (don't use hardcoded dates)
+   - Always use the current year when calculating dates
+   - When calling the book_appointment tool, use the calculated future date in YYYY-MM-DD format
+   - NEVER use hardcoded past dates like 2023-XX-XX
 6. If you get stuck in a loop or can't find availability, suggest booking at a different time 
    rather than repeatedly searching for available slots.
 7. Properly handle conversational follow-ups like "thank you", "yes", "no", or other short responses.
    Maintain the context of previous messages when responding to these.
 8. When a customer responds with "yes", "yeah", "sure", "ok", "correct", or any affirmative response
    after you've asked about booking details, ALWAYS proceed with the booking by calling the book_appointment
-   tool with the date and time you previously confirmed with them. DO NOT ask for the date and time again.
+   tool with the CORRECTLY CALCULATED date and time.
 9. If a customer says "no" after your confirmation question, ask for their preferred alternative time.
 10. If a customer tries to book an appointment when they already have one, check if the appointment is 
     for someone else (like "for my brother" or "for my friend"). If so, treat it as a separate booking
